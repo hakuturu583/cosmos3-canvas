@@ -1,0 +1,18 @@
+[project]
+name = "cosmos3-canvas"
+version = "0.1.0"
+description = "Cosmos3-Nano-Sim-Auto (cameras + LiDAR) as a carla_canvas renderer"
+requires-python = ">=3.11"
+dependencies = ["carla-canvas>=0.2", "numpy", "scipy", "opencv-python-headless"]
+
+[project.optional-dependencies]
+# cosmos_framework (the model) and cosmos_auto (the cookbook's control renderers) are installed
+# from a cosmos-framework checkout; roadgen exports the map.
+map = ["roadgen>=0.37"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cosmos3_canvas"]
