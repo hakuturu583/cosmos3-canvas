@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Cosmos3-Nano-Sim-Auto (cameras + LiDAR) as a carla_canvas renderer"
 requires-python = ">=3.11"
 dependencies = ["carla-canvas>=0.2", "numpy", "scipy", "opencv-python-headless"]
+license = "Apache-2.0"
+readme = "README.md"
 
 [project.optional-dependencies]
 # cosmos_framework (the model) and cosmos_auto (the cookbook's control renderers) are installed
