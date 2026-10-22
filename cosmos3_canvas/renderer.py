@@ -13,14 +13,21 @@ Hyperion 8 cameras and the Pandar128 LiDAR together, 0.4 s at a time:
   HD-map range maps are drawn from the sensors' poses and the actors' boxes at
   the frames' times, the later ones extrapolated from the last ticks
   (trajectory.py), and generated with the rolling K/V cache (stream.py);
-* a CARLA camera reads the frame nearest to its tick's time, reprojected from
-  its Hyperion camera's F-theta lens onto its pinhole; a LiDAR measurement reads
-  each ray from the sweep covering its time (sensors.py).
+* a CARLA camera reads the frame nearest to its tick's time, as generated:
+  its Hyperion camera's F-theta (fisheye) image; a LiDAR measurement reads each
+  ray from the sweep covering its time (sensors.py).
 
 Which Hyperion camera a CARLA camera is: ``options.camera_map`` (role_name ->
 camera key), else the configured camera nearest to its yaw on the vehicle.
 Every configured camera needs a CARLA camera on the ego (its pose), and the ego
 one LiDAR (else a virtual one 1.94 m above the ego's origin).
+
+The cameras are the model's, not any camera: a CARLA camera must be its Hyperion
+camera's generated image exactly -- its size (832x480 at resolution 480) and the
+fov the camera is named for (120, 70 or 30) -- and is refused otherwise, as is a
+second CARLA camera for one Hyperion camera. ``python -m cosmos3_canvas.camera
+<key>`` prints the camera as an autoware_carla_scenario ``driver.cameras`` entry,
+with its F-theta lens.
 
 Configuration (``renderer`` section of the carla_canvas file)::
 
@@ -59,7 +66,9 @@ from carla_canvas import CameraFrame, CameraView, Renderer, WorldInfo
 from carla_canvas.geometry import Transform, to_frame
 from carla_canvas.renderer import LidarView, RayHits
 
-from .controls import HYPERION_CAMERAS, Box, LidarControl, WsmCamera, camera_pose_cv, lidar_control_frames
+from .controls import (HYPERION_CAMERAS, Box, LidarControl, WsmCamera, camera_pose_cv, default_ftheta,
+                       lidar_control_frames)
+from .sensors import GENERATED_SIZE, GeneratedLens
 from .trajectory import Track
 
 log = logging.getLogger("cosmos3_canvas")
@@ -98,7 +107,7 @@ class _Rollout:
     wsm: dict[str, WsmCamera] = field(default_factory=dict)
     frames: dict[int, list[np.ndarray]] = field(default_factory=dict)  # stream frame -> per configured camera
     sweeps: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)  # stream sweep -> range, intensity
-    remaps: dict[int, Any] = field(default_factory=dict)
+    checked: set[int] = field(default_factory=set)  # CARLA cameras found to be their Hyperion camera
 
 
 class Cosmos3Renderer(Renderer):
@@ -118,9 +127,17 @@ class Cosmos3Renderer(Renderer):
         self.caption = str(o.get("caption", "A daytime drive on a dry, sunlit urban road with clear lane markings."))
         self.captions = [str(c) for c in o.get("captions", [self.caption] * len(self.cameras))]
         self.camera_map = dict(o.get("camera_map", {}))
+        for role, key in self.camera_map.items():
+            if key not in self.cameras:
+                raise ValueError(f"camera_map maps {role!r} to {key!r}, which is not one of the cameras "
+                                 f"generated ({self.cameras})")
         self.horizon = float(o.get("horizon_seconds", 60.0))
         self.seed = int(o.get("seed", 0))
         self.resolution = str(o.get("resolution", "480"))
+        if self.resolution not in GENERATED_SIZE:
+            raise ValueError(f"resolution {self.resolution!r}: one of {sorted(GENERATED_SIZE)}")
+        self.lenses = {key: GeneratedLens.of(default_ftheta(key), key, GENERATED_SIZE[self.resolution])
+                       for key in self.cameras}
         self.actor_patterns = list(o.get("actors", ["vehicle.*", "walker.pedestrian.*"]))
         self.reset_gap = float(o.get("reset_after_seconds", 1.0))
         self.setup_args = [str(a) for a in o.get("setup_args", [])]
@@ -148,6 +165,9 @@ class Cosmos3Renderer(Renderer):
                 self._map_key = key
             if self._stream is None:
                 self._stream = self._load_stream(world)
+                if tuple(self._stream.size) != GENERATED_SIZE[self.resolution]:
+                    raise RuntimeError(f"the model generates {self._stream.size} frames at resolution "
+                                       f"{self.resolution}, not {GENERATED_SIZE[self.resolution]}")
             else:
                 self._stream.reset()
             if self._lidar_grid is None:
@@ -159,20 +179,21 @@ class Cosmos3Renderer(Renderer):
         with self._lock:
             rollout = self._advance(view.scene, view.sensor_id)
             key = rollout.camera_keys.get(view.sensor_id)
+            cam = view.camera
+            if view.sensor_id not in rollout.checked:
+                # Before anything is generated for it: a camera that is not its
+                # Hyperion camera's image is a configuration error, not a frame.
+                role = view.attributes.get("role_name", "") if view.attributes else ""
+                self.lenses[key].check_camera(cam.width, cam.height, cam.fov,
+                                              f"CARLA camera {role or view.sensor_id} ({key})")
+                rollout.checked.add(view.sensor_id)
             frame_index = max(0, round((view.scene.elapsed_seconds - rollout.t0) / FRAME_SECONDS))
             self._ensure(rollout, self._chunk_of_frame(frame_index))
-            cam = view.camera
-            remap = rollout.remaps.get(view.sensor_id)
-            if remap is None:
-                from .sensors import PinholeFromFtheta
-
-                remap = rollout.remaps[view.sensor_id] = PinholeFromFtheta.build(
-                    rollout.wsm[key].camera, self._stream.size, cam.width, cam.height, cam.fov)
             frames = rollout.frames.get(frame_index)
             generated = frames[self.cameras.index(key)] if frames is not None else None
             if generated is None:
                 return CameraFrame(rgb=np.zeros((cam.height, cam.width, 3), np.uint8))
-            return CameraFrame(rgb=remap.apply(generated))
+            return CameraFrame(rgb=np.ascontiguousarray(generated))
 
     def cast_lidar_rays(self, view: LidarView) -> RayHits:
         with self._lock:
@@ -278,7 +299,11 @@ class Cosmos3Renderer(Renderer):
         mount = np.linalg.inv(ego) @ sensor
         yaw = math.degrees(math.atan2(mount[1, 0], mount[0, 0]))
         taken = set(rollout.camera_keys.values())
-        free = [k for k in self.cameras if k not in taken] or self.cameras
+        free = [k for k in self.cameras if k not in taken]
+        if not free:
+            raise ValueError(f"CARLA camera {role or actor_id} on the ego: every generated camera "
+                             f"({self.cameras}) has one already; add its Hyperion camera to "
+                             f"renderer.options.cameras, or remove the camera")
         return min(free, key=lambda k: abs((NOMINAL_YAW[k] - yaw + 180) % 360 - 180))
 
     # -- chunks -------------------------------------------------------------------
