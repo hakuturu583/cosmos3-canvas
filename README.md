@@ -84,7 +84,7 @@ The cameras are the model's: the Hyperion 8 cameras, each through its own F-thet
 
 Any other camera is refused (`ValueError`, before anything is generated for it), as is a second CARLA camera for one Hyperion camera, and a `camera_map` naming a camera not in `cameras`. Its mount on the ego is free.
 
-`python -m cosmos3_canvas.camera <camera> [--resolution 480]` prints the camera as an [autoware_carla_scenario](https://github.com/autowarefoundation/autoware_carla_scenario) `driver.cameras` entry, with its F-theta `lens` (principal point, both polynomials, maximum angle and `linear_cde`, in the generated frames' pixels):
+`python -m cosmos3_canvas.camera <camera> [--resolution 480]` prints the camera as an [autoware_carla_scenario](https://github.com/autowarefoundation/autoware_carla_scenario) `driver.cameras` entry, with its F-theta `lens` (principal point, both polynomials and which one defines the lens, maximum angle and `linear_cde`, in the generated frames' pixels):
 
 ```yaml
 - logical_id: "camera_front_wide_120fov"
@@ -98,6 +98,7 @@ Any other camera is refused (`ValueError`, before anything is generated for it),
     angle_to_pixeldist_poly: [0.0, 411.286296, 2.40299018, -16.2530848, 10.3586782, -3.39986006]
     max_angle: 1.226783919
     linear_cde: [1.00234926, 0.0, 0.0]
+    reference_poly: "pixeldist_to_angle"
 ```
 
 ## Limits

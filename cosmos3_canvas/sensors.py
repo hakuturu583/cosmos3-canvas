@@ -58,6 +58,7 @@ class GeneratedLens:
     angle_to_pixeldist_poly: tuple[float, ...]  # angle (rad) -> radius (px)
     max_angle: float  # rad: the lens' (rays beyond it are outside the model)
     linear_cde: tuple[float, float, float]
+    reference_poly: str = "pixeldist_to_angle"  # the polynomial the lens is defined by; the other is fitted
 
     @staticmethod
     def of(ftheta, camera_key: str, generated_size: tuple[int, int]) -> "GeneratedLens":
@@ -81,6 +82,8 @@ class GeneratedLens:
             angle_to_pixeldist_poly=tuple(float(v) for v in fw),
             max_angle=float(ftheta._max_ray_angle),
             linear_cde=(c * sx / sy, d * sx / sy, e),
+            reference_poly="pixeldist_to_angle" if getattr(ftheta, "reference_poly", "bw") == "bw"
+            else "angle_to_pixeldist",
         )
 
     @property
@@ -123,6 +126,7 @@ class GeneratedLens:
                 "angle_to_pixeldist_poly": [float(f"{v:.9g}") for v in self.angle_to_pixeldist_poly],
                 "max_angle": round(self.max_angle, 9),
                 "linear_cde": [float(f"{v:.9g}") for v in self.linear_cde],
+                "reference_poly": self.reference_poly,
             },
         }
 
