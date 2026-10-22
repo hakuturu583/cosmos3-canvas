@@ -84,6 +84,21 @@ NOMINAL_YAW = {
 VIRTUAL_LIDAR_HEIGHT_M = 1.94
 
 
+def _from_drawn_pose(actual: np.ndarray, drawn: np.ndarray, directions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """A LiDAR at the sensor-to-world pose *actual* reads a sweep drawn from the pose
+    *drawn*: its rays' (N, 3) sensor-frame *directions* as the drawn sweep's, and what
+    to add to a range read there for the distance from the actual LiDAR along the ray
+    (the drawn origin's offset along it; the small offset across it is not corrected).
+
+    The two differ where the chunk's later sweeps were drawn from extrapolated poses
+    and the ego then moved otherwise -- turning, they would be read rotated.
+    """
+    world = directions @ actual[:3, :3].T
+    in_drawn = world @ drawn[:3, :3]
+    offset = world @ (drawn[:3, 3] - actual[:3, 3])
+    return in_drawn, offset
+
+
 def _box_type(info) -> str:
     if info.type_id.startswith("walker."):
         return "Pedestrian"
@@ -107,6 +122,7 @@ class _Rollout:
     wsm: dict[str, WsmCamera] = field(default_factory=dict)
     frames: dict[int, list[np.ndarray]] = field(default_factory=dict)  # stream frame -> per configured camera
     sweeps: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)  # stream sweep -> range, intensity
+    sweep_poses: dict[int, np.ndarray] = field(default_factory=dict)  # stream sweep -> the LiDAR pose it was drawn at
     checked: set[int] = field(default_factory=set)  # CARLA cameras found to be their Hyperion camera
 
 
@@ -205,8 +221,12 @@ class Cosmos3Renderer(Renderer):
             maps = rollout.sweeps.get(sweep)
             if maps is None:
                 return RayHits(distance=np.full(len(view.directions), np.inf))
-            distance, intensity = self._lidar_grid.read(*maps, view.body_directions(), view.max_distance)
-            return RayHits(distance=distance, intensity=intensity)
+            directions, offset = _from_drawn_pose(view.pose_matrix(), rollout.sweep_poses[sweep],
+                                                  view.body_directions())
+            distance, intensity = self._lidar_grid.read(*maps, directions, view.max_distance + abs(offset).max())
+            distance = distance + offset
+            hit = np.isfinite(distance) & (distance > 0) & (distance <= view.max_distance)
+            return RayHits(distance=np.where(hit, distance, np.inf), intensity=np.where(hit, intensity, 0.0))
 
     def close(self) -> None:
         with self._lock:
@@ -355,10 +375,16 @@ class Cosmos3Renderer(Renderer):
                                               self._boxes(rollout, rollout.t0 + f * FRAME_SECONDS))
                       for f in frames])
             for key in self.cameras])  # [V,F,720,1280,3]
+        # Each sweep drawn from one pose, the LiDAR's at the sweep's start (extrapolated
+        # for the chunk's later sweeps): CARLA's LiDAR measures a sweep at one pose, so
+        # one drawn spinning through the sweep's 0.1 s would be read skewed by the
+        # ego's turn meanwhile. The pose is kept, to read the sweep from where the
+        # LiDAR turns out to be (cast_lidar_rays). Holding the heading of the later
+        # sweeps instead, and leaving all of the turn to the reading, was worse: the
+        # model does not follow a control that turns at once between two chunks.
+        poses = {s: self._lidar_pose(rollout, rollout.t0 + s * SWEEP_SECONDS) for s in sweeps}
         ranges = np.stack([
-            self._lidar_control.render(self._lidar_pose(rollout, rollout.t0 + s * SWEEP_SECONDS),
-                                       self._lidar_pose(rollout, rollout.t0 + (s + 1) * SWEEP_SECONDS),
-                                       self._boxes(rollout, rollout.t0 + s * SWEEP_SECONDS))
+            self._lidar_control.render(poses[s], poses[s], self._boxes(rollout, rollout.t0 + s * SWEEP_SECONDS))
             for s in sweeps])  # [S,128,1800]
         controls_seconds = time.perf_counter() - t_start
         chunk = self._stream.step(torch.from_numpy(camera_controls), torch.from_numpy(lidar_control_frames(ranges)))
@@ -367,10 +393,12 @@ class Cosmos3Renderer(Renderer):
             rollout.frames[f] = [rgb[v, i] for v in range(len(self.cameras))]
         for i, s in enumerate(sweeps):
             rollout.sweeps[s] = (chunk.range_m[i].numpy(), chunk.intensity[i].numpy())
+            rollout.sweep_poses[s] = poses[s]
         for old in [f for f in rollout.frames if f < frames.start - 24]:
             del rollout.frames[old]
         for old in [s for s in rollout.sweeps if s < sweeps.start - 8]:
             del rollout.sweeps[old]
+            rollout.sweep_poses.pop(old, None)
         timing = {"chunk": k, "controls": controls_seconds, **chunk.seconds}
         self.timings.append(timing)
         log.info("chunk %d (%.1f-%.1f s): %s", k, frames.start * FRAME_SECONDS, frames.stop * FRAME_SECONDS,
