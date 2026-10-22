@@ -32,7 +32,7 @@ The model generates the Hyperion 8 cameras and the Pandar128 LiDAR together, one
 | `stream.py` | Drives the framework's rolling sampler (`iter_rolling_transfer_ar`) one chunk at a time. The model, the plans, the text and the caption schedule are built by framework code from a two-chunk bootstrap request. The control and target latents are then latent buffers covering the whole rollout. Each chunk's controls are encoded with the VAEs' causal streaming encoders, and its outputs decoded with their streaming decoders. |
 | `controls.py` | Draws the controls with the cookbook's renderers (`cosmos_auto`), one frame or sweep at a time: WSM v4 control frames, and LiDAR HD-map range maps. The map is the CARLA map's OpenDRIVE, exported to RDS-HQ with [roadgen](https://pypi.org/project/roadgen/). The poses and boxes come from the live scene. The renderers' steps that read the whole clip are replaced by ones that read only the past (the module's docstring lists them). |
 | `renderer.py` | The carla_canvas renderer. It tracks the ego's sensors and the actors, and extrapolates their poses for the rest of a chunk (`trajectory.py`, from lidarverse_canvas). It generates a chunk when a tick needs one. |
-| `sensors.py` | Turns the outputs into measurements. A CARLA camera samples its Hyperion camera's F-theta image along its pinhole rays; pixels outside the lens' field of view are black. A LiDAR ray reads the range-map cell it points at. |
+| `sensors.py` | Turns the outputs into measurements. A CARLA camera gets its Hyperion camera's generated F-theta (fisheye) image as it is. A LiDAR ray reads the range-map cell it points at. |
 
 Checked against the framework's batch inference on the same controls:
 
@@ -75,11 +75,36 @@ On an RTX PRO 6000 Max-Q, one camera at 480p and the LiDAR, a 0.4 s chunk takes 
 
 A 10 s scenario takes about 4 minutes. The generation is bound by the transformer's matrix multiplies. About 70 % of a chunk's tokens are the LiDAR's.
 
+## Cameras
+
+The cameras are the model's: the Hyperion 8 cameras, each through its own F-theta lens (the cookbook's intrinsics), generated at the run's `resolution` (832x480 at `480`). A CARLA camera standing for one gets that fisheye image as it is, so it must be exactly that camera:
+
+- its size, the generated frames' (832x480 at `480`);
+- its `fov`, the one the camera is named for (120, 70 or 30).
+
+Any other camera is refused (`ValueError`, before anything is generated for it), as is a second CARLA camera for one Hyperion camera, and a `camera_map` naming a camera not in `cameras`. Its mount on the ego is free.
+
+`python -m cosmos3_canvas.camera <camera> [--resolution 480]` prints the camera as an [autoware_carla_scenario](https://github.com/autowarefoundation/autoware_carla_scenario) `driver.cameras` entry, with its F-theta `lens` (principal point, both polynomials, maximum angle and `linear_cde`, in the generated frames' pixels):
+
+```yaml
+- logical_id: "camera_front_wide_120fov"
+  image_width: 832
+  image_height: 480
+  fov: 120.0
+  lens:
+    model: "ftheta"
+    principal_point: [412.641208, 242.790324]
+    pixeldist_to_angle_poly: [0.0, 0.00243165382, -4.05625414e-08, 6.10818843e-10, -9.93181484e-13, 8.73787714e-16]
+    angle_to_pixeldist_poly: [0.0, 411.286296, 2.40299018, -16.2530848, 10.3586782, -3.39986006]
+    max_angle: 1.226783919
+    linear_cde: [1.00234926, 0.0, 0.0]
+```
+
 ## Limits
 
 - Traffic-light states are not sent by carla_canvas, so the lights are drawn "unknown" in the controls.
 - The rollout's length is set up front (`horizon_seconds`). Past it, the sensors are dark.
-- Every configured camera needs a CARLA camera on the ego, mapped by `camera_map` (role name to camera key) or by its yaw. The ego needs one ray-cast LiDAR; without one, a virtual LiDAR 1.94 m above the ego is used. Further LiDARs get no returns.
+- Every configured camera needs a CARLA camera on the ego, mapped by `camera_map` (role name to camera key) or by its yaw, and only the generated cameras are cameras (see [Cameras](#cameras)). The ego needs one ray-cast LiDAR; without one, a virtual LiDAR 1.94 m above the ego is used. Further LiDARs get no returns.
 - Generated LiDAR is the Pandar128's: +15° to −25°, 5 to 100 m.
 
 ## License
