@@ -18,7 +18,8 @@ Hyperion 8 cameras and the Pandar128 LiDAR together, 0.4 s at a time:
   ray from the sweep covering its time (sensors.py).
 
 Which Hyperion camera a CARLA camera is: ``options.camera_map`` (role_name ->
-camera key), else the configured camera nearest to its yaw on the vehicle.
+camera key), else, among the configured cameras of its ``fov``, the one nearest to its
+yaw on the vehicle (so a front tele and the front wide camera tell apart).
 Every configured camera needs a CARLA camera on the ego (its pose), and the ego
 one LiDAR (else a virtual one 1.94 m above the ego's origin).
 
@@ -43,6 +44,14 @@ Configuration (``renderer`` section of the carla_canvas file)::
         seed: 0
         resolution: "480"
         actors: ["vehicle.*", "walker.pedestrian.*"]
+        engine: framework        # or flashdreams (cameras only, about 3x faster; see below)
+        record_dir: /tmp/cosmos3_record  # optional: write each frame's WSM and generated image (record.py)
+
+``engine: flashdreams`` generates with NVIDIA's FlashDreams runtime
+(flashdreams_stream.py) instead of cosmos-framework's sampler: the cameras
+only (a ray-cast LiDAR gets no returns), with no horizon (``horizon_seconds``
+is the duration the captions state). ``compile_denoise: default`` compiles its
+denoiser.
 
 Traffic-light states are not drawn (carla_canvas does not send them): lights are
 "unknown" in the controls.
@@ -63,12 +72,12 @@ from typing import Any
 import numpy as np
 
 from carla_canvas import CameraFrame, CameraView, Renderer, WorldInfo
-from carla_canvas.geometry import Transform, to_frame
+from carla_canvas.geometry import Transform, to_frame, vectors_to_frame
 from carla_canvas.renderer import LidarView, RayHits
 
 from .controls import (HYPERION_CAMERAS, Box, LidarControl, WsmCamera, camera_pose_cv, default_ftheta,
                        lidar_control_frames)
-from .sensors import GENERATED_SIZE, GeneratedLens
+from .sensors import GENERATED_SIZE, NOMINAL_FOV, GeneratedLens
 from .trajectory import Track
 
 log = logging.getLogger("cosmos3_canvas")
@@ -157,6 +166,14 @@ class Cosmos3Renderer(Renderer):
         self.actor_patterns = list(o.get("actors", ["vehicle.*", "walker.pedestrian.*"]))
         self.reset_gap = float(o.get("reset_after_seconds", 1.0))
         self.setup_args = [str(a) for a in o.get("setup_args", [])]
+        self.engine = str(o.get("engine", "framework"))
+        if self.engine not in ("framework", "flashdreams"):
+            raise ValueError(f"engine {self.engine!r}: framework or flashdreams")
+        self._recorder = None
+        if o.get("record_dir"):
+            from .record import Recorder
+
+            self._recorder = Recorder(o["record_dir"], self.cameras, GENERATED_SIZE[self.resolution])
         self._rdshq: tuple[Path, str] | None = None
         self._tmp: tempfile.TemporaryDirectory | None = None
         self._map_key: str | None = None
@@ -174,6 +191,7 @@ class Cosmos3Renderer(Renderer):
             self._rollout = None
             if not world.opendrive:
                 raise RuntimeError("cosmos3 needs the map's OpenDRIVE (carla_canvas protocol 2)")
+            self._map_name = world.map_name
             key = "xodr:" + hashlib.sha256(world.opendrive.encode()).hexdigest()
             if key != self._map_key:
                 self._rdshq = self._export_rdshq(world.opendrive)
@@ -214,7 +232,7 @@ class Cosmos3Renderer(Renderer):
     def cast_lidar_rays(self, view: LidarView) -> RayHits:
         with self._lock:
             rollout = self._advance(view.scene, view.sensor_id)
-            if view.sensor_id != rollout.lidar_id:
+            if view.sensor_id != rollout.lidar_id or not self._stream.lidar:
                 return RayHits(distance=np.full(len(view.directions), np.inf))
             sweep = max(0, math.floor((view.scene.elapsed_seconds - rollout.t0) / SWEEP_SECONDS + 1e-6))
             self._ensure(rollout, self._chunk_of_sweep(sweep))
@@ -229,6 +247,8 @@ class Cosmos3Renderer(Renderer):
             return RayHits(distance=np.where(hit, distance, np.inf), intensity=np.where(hit, intensity, 0.0))
 
     def close(self) -> None:
+        if self._recorder is not None:
+            self._recorder.flush()
         with self._lock:
             self._rollout = None
             self._stream = None
@@ -258,6 +278,15 @@ class Cosmos3Renderer(Renderer):
 
         checkpoint = world.resolve(self.options["checkpoint"])
         log.info("loading Cosmos3 from %s (cameras %s)", checkpoint, self.cameras)
+        if self.engine == "flashdreams":
+            from .flashdreams_stream import FlashDreamsStream
+
+            log.warning("engine flashdreams generates the cameras only: a ray-cast LiDAR gets no returns")
+            steps = self.options.get("denoise_steps")
+            return FlashDreamsStream(checkpoint, self.cameras, self.captions, horizon_seconds=self.horizon,
+                                     seed=self.seed, resolution=self.resolution,
+                                     compile_denoise=self.options.get("compile_denoise"),
+                                     denoise_steps=None if steps is None else int(steps))
         workdir = Path(self.options.get("workdir", Path(tempfile.gettempdir()) / "cosmos3_canvas"))
         return Cosmos3Stream(checkpoint, self.cameras, self.captions, horizon_seconds=self.horizon,
                              workdir=world.resolve(str(workdir)), seed=self.seed, resolution=self.resolution,
@@ -279,19 +308,26 @@ class Cosmos3Renderer(Renderer):
             self._stream.reset()
             rollout = self._rollout = _Rollout(t0=t, last_time=t, ego_id=ego_id)
             rollout.wsm = {key: WsmCamera(*self._rdshq, key) for key in self.cameras}
+            if self._recorder is not None:
+                self._recorder.new_rollout({
+                    "map": getattr(self, "_map_name", ""), "fps": 1.0 / FRAME_SECONDS,
+                    "cameras": {key: self.lenses[key].as_driver_camera() for key in self.cameras}})
         rollout.last_time = t
         self._track(rollout, scene, t)
         return rollout
 
     def _track(self, rollout: _Rollout, scene, t: float) -> None:
         frame = self.coordinate_frame
+        ego_velocity = None
         if rollout.ego_id and rollout.ego_id in scene.states:
-            rollout.ego.add(t, scene.transform(rollout.ego_id).matrix(frame))
+            ego_velocity = vectors_to_frame(np.asarray(scene.states[rollout.ego_id].velocity, np.float64), frame)
+            rollout.ego.add(t, scene.transform(rollout.ego_id).matrix(frame), ego_velocity)
         for actor_id, info in scene.actors.items():
             if info.parent_id != rollout.ego_id or not rollout.ego_id or actor_id not in scene.states:
                 continue
             if info.type_id == "sensor.camera.rgb" or info.type_id.startswith("sensor.lidar.ray_cast"):
-                rollout.sensors.setdefault(actor_id, Track(maxlen=4)).add(t, scene.transform(actor_id).matrix(frame))
+                rollout.sensors.setdefault(actor_id, Track(maxlen=4)).add(
+                    t, scene.transform(actor_id).matrix(frame), ego_velocity)  # rigid on the ego
             if info.type_id == "sensor.camera.rgb" and actor_id not in rollout.camera_keys:
                 rollout.camera_keys[actor_id] = self._camera_key(info, rollout, actor_id)
             if info.type_id == "sensor.lidar.ray_cast" and rollout.lidar_id is None:
@@ -305,10 +341,31 @@ class Cosmos3Renderer(Renderer):
             entry = rollout.actors.get(info.id)
             if entry is None:
                 entry = rollout.actors[info.id] = (Track(maxlen=4), 2 * np.asarray(b.extent, np.float64), _box_type(info))
-            entry[0].add(t, box_to_world)
+            entry[0].add(t, box_to_world, vectors_to_frame(np.asarray(scene.states[info.id].velocity, np.float64), frame)
+                          if info.id in scene.states else None)
             present.add(info.id)
         for gone in set(rollout.actors) - present:
             del rollout.actors[gone]
+        if self._recorder is not None and rollout.ego_id:
+            self._record_poses(rollout, scene, t)
+
+    def _record_poses(self, rollout: _Rollout, scene, t: float) -> None:
+        if t <= getattr(rollout, "posed_until", -math.inf):
+            return  # this tick's already written (each sensor's reading tracks it again)
+        rollout.posed_until = t  # type: ignore[attr-defined]
+        def pose(transform) -> list[float]:
+            return [round(float(v), 4) for v in (*transform.location, *transform.rotation)]
+
+        actors = {}
+        for info, transform in scene.bodies(exclude={rollout.ego_id}):
+            if info.id in rollout.actors:
+                actors[str(info.id)] = {"type_id": info.type_id, "pose": pose(transform)}
+        ego = scene.actors.get(rollout.ego_id)
+        self._recorder.poses(t - rollout.t0, {
+            "ego": {"id": rollout.ego_id, "type_id": ego.type_id if ego else "",
+                    "pose": pose(scene.transform(rollout.ego_id))},
+            "actors": actors,
+            "cameras": {key: pose(scene.transform(actor_id)) for actor_id, key in rollout.camera_keys.items()}})
 
     def _camera_key(self, info, rollout: _Rollout, actor_id: int) -> str:
         role = info.attributes.get("role_name", "")
@@ -324,7 +381,12 @@ class Cosmos3Renderer(Renderer):
             raise ValueError(f"CARLA camera {role or actor_id} on the ego: every generated camera "
                              f"({self.cameras}) has one already; add its Hyperion camera to "
                              f"renderer.options.cameras, or remove the camera")
-        return min(free, key=lambda k: abs((NOMINAL_YAW[k] - yaw + 180) % 360 - 180))
+        try:
+            fov = float(info.attributes.get("fov", "nan"))
+        except (TypeError, ValueError):
+            fov = math.nan
+        same_fov = [k for k in free if abs(NOMINAL_FOV[k] - fov) < 0.5]
+        return min(same_fov or free, key=lambda k: abs((NOMINAL_YAW[k] - yaw + 180) % 360 - 180))
 
     # -- chunks -------------------------------------------------------------------
 
@@ -369,12 +431,20 @@ class Cosmos3Renderer(Renderer):
         from .stream import chunk_camera_frames, chunk_lidar_sweeps
 
         t_start = time.perf_counter()
+        stream = self._stream
         frames, sweeps = chunk_camera_frames(k), chunk_lidar_sweeps(k)
-        camera_controls = np.stack([
-            np.stack([rollout.wsm[key].render(self._camera_pose(rollout, key, rollout.t0 + f * FRAME_SECONDS),
-                                              self._boxes(rollout, rollout.t0 + f * FRAME_SECONDS))
-                      for f in frames])
-            for key in self.cameras])  # [V,F,720,1280,3]
+        # A stream with lookahead (FlashDreams) takes chunk 1's controls with chunk 0's,
+        # drawn from the poses extrapolated from the first tick.
+        lookahead = getattr(stream, "lookahead", 0)
+        camera_controls = None if lookahead and k == 1 else self._camera_controls(rollout, frames)
+        extra = {}
+        if lookahead and k == 0:
+            extra["next_camera_controls"] = torch.from_numpy(self._camera_controls(rollout, chunk_camera_frames(1)))
+        if not stream.lidar:
+            controls_seconds = time.perf_counter() - t_start
+            chunk = stream.step(None if camera_controls is None else torch.from_numpy(camera_controls), None, **extra)
+            self._keep(rollout, k, frames, chunk.rgb.numpy(), controls_seconds, chunk.seconds)
+            return
         # Each sweep drawn from one pose, the LiDAR's at the sweep's start (extrapolated
         # for the chunk's later sweeps): CARLA's LiDAR measures a sweep at one pose, so
         # one drawn spinning through the sweep's 0.1 s would be read skewed by the
@@ -387,19 +457,35 @@ class Cosmos3Renderer(Renderer):
             self._lidar_control.render(poses[s], poses[s], self._boxes(rollout, rollout.t0 + s * SWEEP_SECONDS))
             for s in sweeps])  # [S,128,1800]
         controls_seconds = time.perf_counter() - t_start
-        chunk = self._stream.step(torch.from_numpy(camera_controls), torch.from_numpy(lidar_control_frames(ranges)))
-        rgb = chunk.rgb.numpy()
-        for i, f in enumerate(frames):
-            rollout.frames[f] = [rgb[v, i] for v in range(len(self.cameras))]
+        chunk = stream.step(torch.from_numpy(camera_controls), torch.from_numpy(lidar_control_frames(ranges)), **extra)
         for i, s in enumerate(sweeps):
             rollout.sweeps[s] = (chunk.range_m[i].numpy(), chunk.intensity[i].numpy())
             rollout.sweep_poses[s] = poses[s]
-        for old in [f for f in rollout.frames if f < frames.start - 24]:
-            del rollout.frames[old]
         for old in [s for s in rollout.sweeps if s < sweeps.start - 8]:
             del rollout.sweeps[old]
             rollout.sweep_poses.pop(old, None)
-        timing = {"chunk": k, "controls": controls_seconds, **chunk.seconds}
+        self._keep(rollout, k, frames, chunk.rgb.numpy(), controls_seconds, chunk.seconds)
+
+    def _camera_controls(self, rollout: _Rollout, frames: range) -> np.ndarray:
+        """[V,F,720,1280,3] WSM control frames of the configured cameras at stream ``frames``."""
+        controls = np.stack([
+            np.stack([rollout.wsm[key].render(self._camera_pose(rollout, key, rollout.t0 + f * FRAME_SECONDS),
+                                              self._boxes(rollout, rollout.t0 + f * FRAME_SECONDS))
+                      for f in frames])
+            for key in self.cameras])
+        if self._recorder is not None:
+            self._recorder.put("wsm", frames, controls)
+        return controls
+
+    def _keep(self, rollout: _Rollout, k: int, frames: range, rgb: np.ndarray, controls_seconds: float,
+              seconds: dict[str, float]) -> None:
+        for i, f in enumerate(frames):
+            rollout.frames[f] = [rgb[v, i] for v in range(len(self.cameras))]
+        if self._recorder is not None:
+            self._recorder.put("rgb", frames, rgb)
+        for old in [f for f in rollout.frames if f < frames.start - 24]:
+            del rollout.frames[old]
+        timing = {"chunk": k, "controls": controls_seconds, **seconds}
         self.timings.append(timing)
         log.info("chunk %d (%.1f-%.1f s): %s", k, frames.start * FRAME_SECONDS, frames.stop * FRAME_SECONDS,
                  {key: round(value, 2) for key, value in timing.items() if key != "chunk"})
