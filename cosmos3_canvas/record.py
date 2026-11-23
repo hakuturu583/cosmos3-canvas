@@ -161,6 +161,42 @@ def compose(directory: Path, frame: int, cameras: Sequence[str],
     return np.concatenate([g for pair in zip(grids, [gap] * len(grids)) for g in pair][:-1], axis=1)
 
 
+#: frame colours of the phases (``--phase``), in order
+PHASE_COLORS = ((255, 150, 0), (0, 200, 90), (60, 140, 255), (230, 60, 200))
+
+
+def parse_phases(specs: Sequence[str]) -> list[tuple[float, str]]:
+    """``["0:warm-up", "6.95:policy"]`` -> phases by start time (s from the rollout's start)."""
+    phases = []
+    for spec in specs:
+        start, _, label = spec.partition(":")
+        phases.append((float(start), label))
+    return sorted(phases)
+
+
+def frame_phase(image: np.ndarray, t: float, phases: Sequence[tuple[float, str]],
+                border: int = 14) -> np.ndarray:
+    """``image`` framed in the colour of the phase ``t`` falls in, its label on a banner at the top."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    current = [i for i, (start, _) in enumerate(phases) if start <= t + 1e-9]
+    if not current:
+        return image
+    index = current[-1]
+    color, label = PHASE_COLORS[index % len(PHASE_COLORS)], phases[index][1]
+    out = image.copy()
+    out[:border], out[-border:], out[:, :border], out[:, -border:] = color, color, color, color
+    canvas = Image.fromarray(out)
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default(size=max(16, image.shape[0] // 24))
+    text = f"{label}   t = {t:5.2f} s"
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    x = (image.shape[1] - (right - left)) // 2
+    draw.rectangle((x - 16, 0, x + right - left + 16, bottom - top + 2 * border), fill=color)
+    draw.text((x, border - top // 2), text, font=font, fill=(0, 0, 0))
+    return np.asarray(canvas)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     import argparse
     import re
@@ -175,6 +211,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--width", type=int, default=2496, help="scale the video to this width")
     parser.add_argument("--panels", default="generated,overlay",
                         help=f"comma-separated, side by side: {', '.join(PANELS)}")
+    parser.add_argument("--phase", action="append", default=[], metavar="START:LABEL",
+                        help="frame the video from START seconds (from the rollout's start) on in a colour, "
+                             "labelled LABEL; repeat for each phase, e.g. --phase 0:warm-up --phase 6.95:policy")
     args = parser.parse_args(argv)
 
     names = [p.name for p in args.rollout.glob("rgb_*.jpg")]
@@ -185,12 +224,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"no recorded frames in {args.rollout}")
     from PIL import Image
 
+    phases = parse_phases(args.phase)
     with imageio.get_writer(args.output, fps=args.fps / args.every, codec="libx264", quality=7,
                             macro_block_size=8) as writer:
         for frame in frames[::args.every]:
             image = compose(args.rollout, frame, cameras, args.panels.split(","))
             if image is None:
                 continue
+            if phases:
+                image = frame_phase(image, frame / args.fps, phases)
             scale = args.width / image.shape[1]
             size = (args.width, int(round(image.shape[0] * scale / 8)) * 8)
             writer.append_data(np.asarray(Image.fromarray(image).resize(size, Image.BILINEAR)))

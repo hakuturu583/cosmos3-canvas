@@ -158,6 +158,8 @@ python tools/carla_replay.py /tmp/cosmos3_record/rollout_000 --port 2000   # a P
 python -m cosmos3_canvas.record /tmp/cosmos3_record/rollout_000 out.mp4 --panels carla,carla_overlay,generated
 ```
 
+`--phase START:LABEL` (repeatable) frames the video in a colour from START seconds on, with LABEL on a banner. For example, `--phase 0:warm-up --phase 6.95:policy` tells a driver's scripted warm-up from its own driving.
+
 The ego's own body is left out (`--with-ego` puts it in). Map props, such as parked cars that are part of the level, show in CARLA's frames but not in the WSM.
 
 ## Cameras

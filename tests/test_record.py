@@ -49,3 +49,14 @@ def test_carla_panels_show_the_carla_frame_and_the_wsm_over_it(tmp_path) -> None
     carla, over = image[:, tile:2 * tile], image[:, 3 * tile + 8 + tile:3 * tile + 8 + 2 * tile]
     assert abs(int(carla[30, 40, 0]) - 30) <= 3 and abs(int(over[30, 40, 0]) - 30) <= 3
     assert over[36, 40, 0] > 120  # the WSM line drawn over the CARLA frame
+
+
+def test_frames_are_framed_in_their_phase_colour() -> None:
+    from cosmos3_canvas.record import PHASE_COLORS, frame_phase, parse_phases
+
+    phases = parse_phases(["6.95:policy", "0:warm-up"])
+    assert phases == [(0.0, "warm-up"), (6.95, "policy")]
+    image = np.zeros((200, 400, 3), np.uint8)
+    assert tuple(frame_phase(image, 1.0, phases)[199, 0]) == PHASE_COLORS[0]
+    assert tuple(frame_phase(image, 7.0, phases)[199, 0]) == PHASE_COLORS[1]
+    assert (frame_phase(image, 1.0, [(2.0, "later")]) == 0).all()  # before any phase: as it was
