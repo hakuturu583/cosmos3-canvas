@@ -30,6 +30,7 @@ The model generates the Hyperion 8 cameras and the Pandar128 LiDAR together, one
 | module | what it does |
 |---|---|
 | `stream.py` | Drives the framework's rolling sampler (`iter_rolling_transfer_ar`) one chunk at a time. The model, the plans, the text and the caption schedule are built by framework code from a two-chunk bootstrap request. The control and target latents are then latent buffers covering the whole rollout. Each chunk's controls are encoded with the VAEs' causal streaming encoders, and its outputs decoded with their streaming decoders. |
+| `flashdreams_stream.py` | The same chunks with [FlashDreams](https://github.com/NVIDIA/flashdreams) (`engine: flashdreams`), cameras only: its `ChunkRollout` reads each chunk's controls from a provider, which here hands it the drawn WSM frames shrunk to the generated size, and its streaming TAEHV decoder decodes them. See [FlashDreams engine](#flashdreams-engine). |
 | `controls.py` | Draws the controls with the cookbook's renderers (`cosmos_auto`), one frame or sweep at a time: WSM v4 control frames, and LiDAR HD-map range maps. The map is the CARLA map's OpenDRIVE, exported to RDS-HQ with [roadgen](https://pypi.org/project/roadgen/). The poses and boxes come from the live scene. The renderers' steps that read the whole clip are replaced by ones that read only the past (the module's docstring lists them). |
 | `renderer.py` | The carla_canvas renderer. It tracks the ego's sensors and the actors, and extrapolates their poses for the rest of a chunk (`trajectory.py`, from lidarverse_canvas). It generates a chunk when a tick needs one. |
 | `sensors.py` | Turns the outputs into measurements. A CARLA camera gets its Hyperion camera's generated F-theta (fisheye) image as it is. A LiDAR ray reads the range-map cell it points at. |
@@ -75,6 +76,66 @@ On an RTX PRO 6000 Max-Q, one camera at 480p and the LiDAR, a 0.4 s chunk takes 
 
 A 10 s scenario takes about 4 minutes. The generation is bound by the transformer's matrix multiplies. About 70 % of a chunk's tokens are the LiDAR's.
 
+## FlashDreams engine
+
+`engine: flashdreams` generates with NVIDIA's [FlashDreams](https://github.com/NVIDIA/flashdreams) runtime instead of cosmos-framework's sampler. It is about 3.3x faster on six cameras, but it generates the cameras only.
+
+```yaml
+renderer:
+  backend: cosmos3_canvas:Cosmos3Renderer
+  options:
+    engine: flashdreams
+    checkpoint: /path/to/Cosmos3-Nano-Sim-Auto   # the HF export: model.safetensors.index.json
+    cameras: [camera_front_wide_120fov, camera_cross_left_120fov, camera_cross_right_120fov]
+    # compile_denoise: default                   # torch.compile the denoiser
+sensors:
+  - sensor.camera.rgb
+```
+
+What changes with this engine:
+
+- **No LiDAR.** A ray-cast LiDAR on the ego gets no returns.
+- **No horizon.** The cache keeps a bounded history, so a rollout does not end. `horizon_seconds` only sets the duration the captions state.
+- **Chunk 1 is drawn ahead.** The rollout's prefill reads the controls one chunk past the history it keeps. The renderer therefore draws chunk 1's controls together with chunk 0's, from poses extrapolated from the first tick at its reported velocity.
+- **Settings are the checkpoint's own** (FlashDreams' `cosmos3_nano_sim_auto.config`): three latent frames (0.4 s) per chunk, decomposed maskless attention with a 0.4 s window, four denoising steps, and one chunk of history.
+
+### Install
+
+The renderer runs from a venv on top of a FlashDreams checkout's:
+
+```bash
+git clone https://github.com/NVIDIA/flashdreams.git
+cd flashdreams && uv sync --frozen --inexact --python 3.12 \
+  --package flashdreams-cosmos3-nano-sim-auto --package flashdreams --group cuda13 && cd ..
+uv venv -p flashdreams/.venv/bin/python fd-canvas-venv
+SP=fd-canvas-venv/lib/python3.12/site-packages
+echo "import site; site.addsitedir('$PWD/flashdreams/.venv/lib/python3.12/site-packages')" > $SP/zz_flashdreams.pth
+printf '%s\n' $PWD/cosmos-framework/.agents/skills/cookbooks/cosmos3/simulation/auto/wsm $PWD/cosmos3-canvas > $SP/cosmos3_canvas_src.pth
+uv pip install -p fd-canvas-venv/bin/python carla-canvas==0.2.0 roadgen==0.37.1 'moderngl>=5.10' 'python-pycg>=0.7' \
+  mpire minio 'shapely>=2.1' hydra-core omegaconf termcolor webdataset trimesh imageio matplotlib pyquaternion ray
+```
+
+Two notes on this setup:
+
+- The cookbook's control renderers come from a cosmos-framework checkout, as for the framework engine. cosmos-framework itself is not needed.
+- FlashDreams' `uv sync` builds an AV1 codec, which needs `yasm`.
+
+Start the renderer with `CUDA_HOME` and `LD_LIBRARY_PATH` pointing at `flashdreams/.venv/lib/python3.12/site-packages/nvidia/cu13`.
+
+### Speed
+
+Measured on an RTX PRO 6000 Max-Q with six cameras at 480p. Each chunk is 0.4 s.
+
+| step | framework (cameras + LiDAR) | flashdreams (cameras) |
+|---|---|---|
+| drawing the controls | 0.5 | 0.5 |
+| encoding them | 1.25 | (in generating) |
+| generating | 15.5 | 5.3 |
+| decoding | 3.3 | 0.1 |
+| a chunk | about 20 s | about 6 s |
+
+With seven cameras (FlashDreams' `--views 7` set, adding `camera_front_tele_30fov`), generating takes about 6.5 s per chunk. A chunk is 12 frames per camera, so this is about 2 fps per camera: not real time. FlashDreams' own sample runs at 15 fps with one camera, and 1.7 fps with seven, on the same GPU.
+
 ## Cameras
 
 The cameras are the model's: the Hyperion 8 cameras, each through its own F-theta lens (the cookbook's intrinsics), generated at the run's `resolution` (832x480 at `480`). A CARLA camera standing for one gets that fisheye image as it is, so it must be exactly that camera:
@@ -104,8 +165,8 @@ Any other camera is refused (`ValueError`, before anything is generated for it),
 ## Limits
 
 - Traffic-light states are not sent by carla_canvas, so the lights are drawn "unknown" in the controls.
-- The rollout's length is set up front (`horizon_seconds`). Past it, the sensors are dark.
-- Every configured camera needs a CARLA camera on the ego, mapped by `camera_map` (role name to camera key) or by its yaw, and only the generated cameras are cameras (see [Cameras](#cameras)). The ego needs one ray-cast LiDAR; without one, a virtual LiDAR 1.94 m above the ego is used. Further LiDARs get no returns.
+- The rollout's length is set up front (`horizon_seconds`). Past it, the sensors are dark. This does not apply to the FlashDreams engine.
+- Every configured camera needs a CARLA camera on the ego, mapped by `camera_map` (role name to camera key) or by its fov, then its yaw (so a front tele and the front wide camera tell apart), and only the generated cameras are cameras (see [Cameras](#cameras)). The ego needs one ray-cast LiDAR; without one, a virtual LiDAR 1.94 m above the ego is used. Further LiDARs get no returns.
 - Generated LiDAR is the Pandar128's: +15° to −25°, 5 to 100 m.
 
 ## License

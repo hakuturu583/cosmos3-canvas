@@ -6,6 +6,8 @@
 A block of sweeps is generated when its first sweep is due, so the poses of
 its later sweeps lie ahead of the simulation: they are extrapolated at the
 constant (screw) velocity of the last two ticks, as are the actors' boxes.
+With a single tick, at the linear velocity the simulator reported with it
+(if any), the heading held.
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ class Track:
 
     def __init__(self, maxlen: int = 8):
         self.samples: deque[tuple[float, np.ndarray]] = deque(maxlen=maxlen)
+        self.velocity: np.ndarray | None = None  # world-frame m/s at the latest sample
 
-    def add(self, t: float, pose: np.ndarray) -> None:
+    def add(self, t: float, pose: np.ndarray, velocity: np.ndarray | None = None) -> None:
+        self.velocity = None if velocity is None else np.asarray(velocity, np.float64)
         if self.samples and t <= self.samples[-1][0] + 1e-9:
             self.samples[-1] = (t, np.asarray(pose, np.float64))  # same tick again
             return
@@ -37,7 +41,10 @@ class Track:
             raise ValueError("no samples")
         times = [s[0] for s in self.samples]
         if len(self.samples) == 1 or t <= times[0]:
-            return self.samples[0][1].copy() if t <= times[0] else self.samples[-1][1].copy()
+            pose = self.samples[0][1].copy() if t <= times[0] else self.samples[-1][1].copy()
+            if t > times[-1] and self.velocity is not None:
+                pose[:3, 3] += self.velocity * (t - times[-1])
+            return pose
         if t >= times[-1]:
             (t0, a), (t1, b) = self.samples[-2], self.samples[-1]
             return _screw(a, b, (t - t0) / (t1 - t0))

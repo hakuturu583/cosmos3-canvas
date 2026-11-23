@@ -86,6 +86,8 @@ class Cosmos3Stream:
     ``horizon_seconds``: the longest rollout; :meth:`step` refuses chunks past it.
     """
 
+    lidar = True  # generates the LiDAR with the cameras
+
     def __init__(
         self,
         checkpoint: str | Path,
