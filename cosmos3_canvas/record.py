@@ -18,7 +18,8 @@ through the same lenses (``carla_<camera>_<frame>.jpg``).
 camera grids side by side: the generated frames, and the WSM drawn over them
 (``--panels`` picks from generated, overlay, wsm, and, once
 ``tools/carla_replay.py`` has rendered the drive with CARLA, carla and
-carla_overlay).
+carla_overlay). ``--trajectory`` draws planned paths (a driver's) on every
+camera, ``--phase`` frames the video by phase.
 
 The files are encoded on a background thread so that recording costs the
 rollout little time.
@@ -26,6 +27,8 @@ rollout little time.
 
 from __future__ import annotations
 
+import json
+import math
 import queue
 import threading
 from collections.abc import Sequence
@@ -91,6 +94,127 @@ class Recorder:
                 self._queue.task_done()
 
 
+# -- poses and trajectories ---------------------------------------------------------------
+
+
+def _lerp_pose(a: list[float], b: list[float], w: float) -> list[float]:
+    """x, y, z, pitch, yaw, roll: positions linearly, angles the short way round."""
+    out = [a[i] + w * (b[i] - a[i]) for i in range(3)]
+    for i in range(3, 6):
+        out.append(a[i] + w * (((b[i] - a[i]) + 180.0) % 360.0 - 180.0))
+    return out
+
+
+class Poses:
+    """``poses.jsonl``: each tracked thing's pose at a time, interpolated between ticks."""
+
+    def __init__(self, path: Path) -> None:
+        self.ticks = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        if not self.ticks:
+            raise ValueError(f"{path}: no ticks")
+        self.times = np.array([tick["t"] for tick in self.ticks])
+
+    def _get(self, tick: dict, kind: str, key: str) -> list[float] | None:
+        if kind == "ego":
+            return tick["ego"]["pose"]
+        if kind == "camera":
+            return tick["cameras"].get(key)
+        actor = tick["actors"].get(key)
+        return None if actor is None else actor["pose"]
+
+    def at(self, t: float, kind: str, key: str = "") -> list[float] | None:
+        i = int(np.searchsorted(self.times, t))
+        if i == 0 or i == len(self.ticks):
+            return self._get(self.ticks[min(i, len(self.ticks) - 1)], kind, key)
+        a, b = self.ticks[i - 1], self.ticks[i]
+        pa, pb = self._get(a, kind, key), self._get(b, kind, key)
+        if pa is None or pb is None:
+            return pa or pb
+        return _lerp_pose(pa, pb, (t - a["t"]) / (b["t"] - a["t"]))
+
+    def actors(self) -> dict[str, str]:
+        """Every actor seen: id -> type_id."""
+        seen: dict[str, str] = {}
+        for tick in self.ticks:
+            for actor_id, actor in tick["actors"].items():
+                seen.setdefault(actor_id, actor["type_id"])
+        return seen
+
+
+def ue_rotation(pitch: float, yaw: float, roll: float) -> np.ndarray:
+    """3x3 whose columns are a CARLA actor's forward, right and up axes in the world (Unreal's)."""
+    p, y, r = (math.radians(a) for a in (pitch, yaw, roll))
+    sp, cp, sy, cy, sr, cr = math.sin(p), math.cos(p), math.sin(y), math.cos(y), math.sin(r), math.cos(r)
+    forward = (cp * cy, cp * sy, sp)
+    right = (sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp)
+    up = (-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp)
+    return np.array([forward, right, up], dtype=float).T
+
+
+def project(points: np.ndarray, camera_pose: Sequence[float], camera: dict) -> tuple[np.ndarray, np.ndarray]:
+    """CARLA-world ``points`` [N, 3] -> (pixels [N, 2], in view [N]) on a recorded camera.
+
+    ``camera_pose``: x, y, z, pitch, yaw, roll (poses.jsonl); ``camera``: its meta.json
+    entry, whose F-theta lens is the generated frame's.
+    """
+    lens = camera["lens"]
+    local = (np.asarray(points, np.float64) - np.asarray(camera_pose[:3])) @ ue_rotation(*camera_pose[3:])
+    rays = np.stack([local[:, 1], -local[:, 2], local[:, 0]], axis=1)  # optical: right, down, forward
+    xy = np.linalg.norm(rays[:, :2], axis=1)
+    theta = np.arctan2(xy, rays[:, 2])
+    radius = np.polynomial.polynomial.polyval(theta, lens["angle_to_pixeldist_poly"])
+    unit = rays[:, :2] / np.maximum(xy, 1e-12)[:, None]
+    c, d, e = lens["linear_cde"]
+    offset = radius[:, None] * unit
+    u = c * offset[:, 0] + d * offset[:, 1] + lens["principal_point"][0]
+    v = e * offset[:, 0] + offset[:, 1] + lens["principal_point"][1]
+    pixels = np.stack([u, v], axis=1)
+    margin = 0.5 * max(camera["image_width"], camera["image_height"])
+    inside = ((u > -margin) & (u < camera["image_width"] + margin)
+              & (v > -margin) & (v < camera["image_height"] + margin))
+    return pixels, (theta < float(lens["max_angle"])) & (rays[:, 2] > 0.1) & inside
+
+
+class Trajectories:
+    """Planned paths over time: a JSONL of ``{"t": s from the rollout's start, "points": [[x, y, z], ...]}``
+    (CARLA's world frame). :meth:`at` is the latest path planned by a time."""
+
+    def __init__(self, path: Path) -> None:
+        rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+        rows.sort(key=lambda row: row["t"])
+        self.times = np.array([row["t"] for row in rows])
+        self.paths = [np.asarray(row["points"], np.float64).reshape(-1, 3) for row in rows]
+
+    def at(self, t: float) -> np.ndarray | None:
+        i = int(np.searchsorted(self.times, t + 1e-9, side="right")) - 1
+        return None if i < 0 else self.paths[i]
+
+
+def draw_path(image: np.ndarray, pixels: np.ndarray, valid: np.ndarray,
+              color: tuple[int, int, int] = (255, 0, 255), width: int = 4) -> np.ndarray:
+    """The path's in-view runs as polylines (a dark outline under ``color``), a dot at each point."""
+    from PIL import Image, ImageDraw
+
+    canvas = Image.fromarray(image)
+    draw = ImageDraw.Draw(canvas)
+    runs, run = [], []
+    for point, ok in zip(pixels, valid):
+        if ok:
+            run.append((float(point[0]), float(point[1])))
+        elif run:
+            runs.append(run)
+            run = []
+    if run:
+        runs.append(run)
+    for run in runs:
+        if len(run) > 1:
+            draw.line(run, fill=(0, 0, 0), width=width + 3, joint="curve")
+            draw.line(run, fill=color, width=width, joint="curve")
+        for x, y in run:
+            draw.ellipse((x - width, y - width, x + width, y + width), fill=color, outline=(0, 0, 0))
+    return np.asarray(canvas)
+
+
 #: grid of the camera tiles in the video, by Hyperion key (None: empty)
 LAYOUT = (
     (None, "camera_front_tele_30fov", None),
@@ -120,8 +244,11 @@ def _panel(panel: str, rgb: np.ndarray | None, wsm: np.ndarray | None,
 
 
 def compose(directory: Path, frame: int, cameras: Sequence[str],
-            panels: Sequence[str] = ("generated", "overlay")) -> np.ndarray | None:
-    """One video frame: a grid of the cameras (:data:`LAYOUT`) per panel, side by side."""
+            panels: Sequence[str] = ("generated", "overlay"), mark=None) -> np.ndarray | None:
+    """One video frame: a grid of the cameras (:data:`LAYOUT`) per panel, side by side.
+
+    ``mark(camera, image) -> image``, if given, draws on every panel's tile of each camera.
+    """
     from PIL import Image, ImageDraw, ImageFont
 
     def load(kind: str, camera: str) -> np.ndarray | None:
@@ -148,6 +275,8 @@ def compose(directory: Path, frame: int, cameras: Sequence[str],
                 if image is None:
                     tiles.append(np.zeros(shape, np.uint8))
                     continue
+                if mark is not None:
+                    image = mark(camera, image)
                 tile = Image.fromarray(image)
                 ImageDraw.Draw(tile).text((10, 6), camera.removeprefix("camera_"), font=font, fill=(255, 255, 0),
                                           stroke_width=2, stroke_fill=(0, 0, 0))
@@ -211,6 +340,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--width", type=int, default=2496, help="scale the video to this width")
     parser.add_argument("--panels", default="generated,overlay",
                         help=f"comma-separated, side by side: {', '.join(PANELS)}")
+    parser.add_argument("--trajectory", type=Path, default=None,
+                        help="a JSONL of planned paths, {\"t\": s from the rollout's start, \"points\": "
+                             "[[x, y, z], ...]} in CARLA's world frame, drawn on every camera")
     parser.add_argument("--phase", action="append", default=[], metavar="START:LABEL",
                         help="frame the video from START seconds (from the rollout's start) on in a colour, "
                              "labelled LABEL; repeat for each phase, e.g. --phase 0:warm-up --phase 6.95:policy")
@@ -225,10 +357,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     from PIL import Image
 
     phases = parse_phases(args.phase)
+    mark_at = None
+    if args.trajectory is not None:
+        meta = json.loads((args.rollout / "meta.json").read_text())
+        poses, plans = Poses(args.rollout / "poses.jsonl"), Trajectories(args.trajectory)
+
+        def mark_at(t: float):
+            path = plans.at(t)
+            if path is None:
+                return None
+
+            def mark(camera: str, image: np.ndarray) -> np.ndarray:
+                pose = poses.at(t, "camera", camera)
+                if pose is None or camera not in meta["cameras"]:
+                    return image
+                pixels, valid = project(path, pose, meta["cameras"][camera])
+                return draw_path(image, pixels, valid)
+            return mark
     with imageio.get_writer(args.output, fps=args.fps / args.every, codec="libx264", quality=7,
                             macro_block_size=8) as writer:
         for frame in frames[::args.every]:
-            image = compose(args.rollout, frame, cameras, args.panels.split(","))
+            image = compose(args.rollout, frame, cameras, args.panels.split(","),
+                            mark=mark_at(frame / args.fps) if mark_at else None)
             if image is None:
                 continue
             if phases:

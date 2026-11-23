@@ -60,3 +60,32 @@ def test_frames_are_framed_in_their_phase_colour() -> None:
     assert tuple(frame_phase(image, 1.0, phases)[199, 0]) == PHASE_COLORS[0]
     assert tuple(frame_phase(image, 7.0, phases)[199, 0]) == PHASE_COLORS[1]
     assert (frame_phase(image, 1.0, [(2.0, "later")]) == 0).all()  # before any phase: as it was
+
+
+def test_a_path_projects_through_the_recorded_lens() -> None:
+    from cosmos3_canvas.record import project
+
+    camera = {"image_width": 832, "image_height": 480,
+              "lens": {"principal_point": [416.0, 240.0], "angle_to_pixeldist_poly": [0.0, 400.0],
+                       "max_angle": 1.2, "linear_cde": [1.0, 0.0, 0.0]}}
+    pose = [0.0, 0.0, 1.5, 0.0, 0.0, 0.0]  # 1.5 m up, looking along +x
+    points = np.array([[10.0, 0.0, 1.5],   # straight ahead: the principal point
+                       [10.0, 2.0, 1.5],   # CARLA's +y is to the right
+                       [10.0, 0.0, 0.0],   # on the ground: below the centre
+                       [-10.0, 0.0, 1.5]])  # behind
+    pixels, valid = project(points, pose, camera)
+    np.testing.assert_allclose(pixels[0], [416.0, 240.0], atol=1e-9)
+    assert pixels[1, 0] > 416.0 and pixels[2, 1] > 240.0
+    assert valid.tolist() == [True, True, True, False]
+
+
+def test_the_latest_plan_by_a_time_is_drawn(tmp_path) -> None:
+    import json
+
+    from cosmos3_canvas.record import Trajectories
+
+    path = tmp_path / "plans.jsonl"
+    path.write_text("".join(json.dumps({"t": t, "points": [[t, 0, 0]]}) + "\n" for t in (7.0, 7.1)))
+    plans = Trajectories(path)
+    assert plans.at(6.9) is None
+    assert plans.at(7.05)[0, 0] == 7.0 and plans.at(7.1)[0, 0] == 7.1

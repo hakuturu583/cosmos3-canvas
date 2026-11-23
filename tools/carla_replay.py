@@ -28,11 +28,15 @@ import json
 import math
 import queue
 import re
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from cosmos3_canvas.record import Poses  # noqa: E402  (numpy only: no carla_canvas, no model)
 
 
 
@@ -44,51 +48,7 @@ def _carla():
     return carla
 
 
-# -- poses ------------------------------------------------------------------------
-
-
-def _lerp_pose(a: list[float], b: list[float], w: float) -> list[float]:
-    """x, y, z, pitch, yaw, roll: positions linearly, angles the short way round."""
-    out = [a[i] + w * (b[i] - a[i]) for i in range(3)]
-    for i in range(3, 6):
-        out.append(a[i] + w * (((b[i] - a[i]) + 180.0) % 360.0 - 180.0))
-    return out
-
-
-class Poses:
-    """``poses.jsonl``: each tracked thing's pose at a time, interpolated between ticks."""
-
-    def __init__(self, path: Path) -> None:
-        self.ticks = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        if not self.ticks:
-            raise SystemExit(f"{path}: no ticks")
-        self.times = np.array([tick["t"] for tick in self.ticks])
-
-    def _get(self, tick: dict, kind: str, key: str) -> list[float] | None:
-        if kind == "ego":
-            return tick["ego"]["pose"]
-        if kind == "camera":
-            return tick["cameras"].get(key)
-        actor = tick["actors"].get(key)
-        return None if actor is None else actor["pose"]
-
-    def at(self, t: float, kind: str, key: str = "") -> list[float] | None:
-        i = int(np.searchsorted(self.times, t))
-        if i == 0 or i == len(self.ticks):
-            return self._get(self.ticks[min(i, len(self.ticks) - 1)], kind, key)
-        a, b = self.ticks[i - 1], self.ticks[i]
-        pa, pb = self._get(a, kind, key), self._get(b, kind, key)
-        if pa is None or pb is None:
-            return pa or pb
-        return _lerp_pose(pa, pb, (t - a["t"]) / (b["t"] - a["t"]))
-
-    def actors(self) -> dict[str, str]:
-        """Every actor seen: id -> type_id."""
-        seen: dict[str, str] = {}
-        for tick in self.ticks:
-            for actor_id, actor in tick["actors"].items():
-                seen.setdefault(actor_id, actor["type_id"])
-        return seen
+# -- poses: cosmos3_canvas.record.Poses -------------------------------------------
 
 
 def _transform(pose: list[float]):
