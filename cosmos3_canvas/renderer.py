@@ -191,6 +191,7 @@ class Cosmos3Renderer(Renderer):
             self._rollout = None
             if not world.opendrive:
                 raise RuntimeError("cosmos3 needs the map's OpenDRIVE (carla_canvas protocol 2)")
+            self._map_name = world.map_name
             key = "xodr:" + hashlib.sha256(world.opendrive.encode()).hexdigest()
             if key != self._map_key:
                 self._rdshq = self._export_rdshq(world.opendrive)
@@ -308,7 +309,9 @@ class Cosmos3Renderer(Renderer):
             rollout = self._rollout = _Rollout(t0=t, last_time=t, ego_id=ego_id)
             rollout.wsm = {key: WsmCamera(*self._rdshq, key) for key in self.cameras}
             if self._recorder is not None:
-                self._recorder.new_rollout()
+                self._recorder.new_rollout({
+                    "map": getattr(self, "_map_name", ""), "fps": 1.0 / FRAME_SECONDS,
+                    "cameras": {key: self.lenses[key].as_driver_camera() for key in self.cameras}})
         rollout.last_time = t
         self._track(rollout, scene, t)
         return rollout
@@ -343,6 +346,26 @@ class Cosmos3Renderer(Renderer):
             present.add(info.id)
         for gone in set(rollout.actors) - present:
             del rollout.actors[gone]
+        if self._recorder is not None and rollout.ego_id:
+            self._record_poses(rollout, scene, t)
+
+    def _record_poses(self, rollout: _Rollout, scene, t: float) -> None:
+        if t <= getattr(rollout, "posed_until", -math.inf):
+            return  # this tick's already written (each sensor's reading tracks it again)
+        rollout.posed_until = t  # type: ignore[attr-defined]
+        def pose(transform) -> list[float]:
+            return [round(float(v), 4) for v in (*transform.location, *transform.rotation)]
+
+        actors = {}
+        for info, transform in scene.bodies(exclude={rollout.ego_id}):
+            if info.id in rollout.actors:
+                actors[str(info.id)] = {"type_id": info.type_id, "pose": pose(transform)}
+        ego = scene.actors.get(rollout.ego_id)
+        self._recorder.poses(t - rollout.t0, {
+            "ego": {"id": rollout.ego_id, "type_id": ego.type_id if ego else "",
+                    "pose": pose(scene.transform(rollout.ego_id))},
+            "actors": actors,
+            "cameras": {key: pose(scene.transform(actor_id)) for actor_id, key in rollout.camera_keys.items()}})
 
     def _camera_key(self, info, rollout: _Rollout, actor_id: int) -> str:
         role = info.attributes.get("role_name", "")

@@ -29,3 +29,23 @@ def test_recorded_frames_compose_into_one_image(tmp_path) -> None:
     # two panels (generated, overlay), each a 3-wide grid of the layout's two rows used, 8 px apart
     assert image.shape == (2 * 48, 2 * 3 * 80 + 8, 3)
     assert compose(recorder.dir, 2, cameras, ("wsm",)).shape == (2 * 48, 3 * 80, 3)
+
+
+def test_carla_panels_show_the_carla_frame_and_the_wsm_over_it(tmp_path) -> None:
+    cameras = ["camera_front_wide_120fov"]
+    recorder = Recorder(tmp_path, cameras, (48, 80))
+    recorder.new_rollout({"map": "Town10HD_Opt"})
+    wsm = np.zeros((1, 1, 48, 80, 3), np.uint8)
+    wsm[..., 36, :, :] = 255  # a line, below the labels
+    recorder.put("wsm", range(0, 1), wsm)
+    recorder.put("rgb", range(0, 1), np.full((1, 1, 48, 80, 3), 128, np.uint8))
+    recorder.put("carla", range(0, 1), np.full((1, 1, 48, 80, 3), 30, np.uint8))
+    recorder.poses(0.05, {"ego": {"id": 1, "type_id": "vehicle.x", "pose": [0, 0, 0, 0, 0, 0]},
+                          "actors": {}, "cameras": {}})
+    recorder.flush()
+    assert (recorder.dir / "meta.json").exists() and (recorder.dir / "poses.jsonl").read_text().count("\n") == 1
+    image = compose(recorder.dir, 0, cameras, ("carla", "carla_overlay"))
+    tile = 80  # one camera's column in the 3-wide grid
+    carla, over = image[:, tile:2 * tile], image[:, 3 * tile + 8 + tile:3 * tile + 8 + 2 * tile]
+    assert abs(int(carla[30, 40, 0]) - 30) <= 3 and abs(int(over[30, 40, 0]) - 30) <= 3
+    assert over[36, 40, 0] > 120  # the WSM line drawn over the CARLA frame

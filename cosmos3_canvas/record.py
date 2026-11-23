@@ -9,9 +9,16 @@ frame and configured camera:
 * ``rgb_<camera>_<frame>.jpg``: the frame the model generated, which the
   CARLA camera standing for it receives.
 
+and, once per rollout and tick, ``meta.json`` (the map, each camera's lens) and
+``poses.jsonl`` (the ego, the actors and the cameras, in CARLA's frame): what
+``tools/carla_replay.py`` needs to render the same drive with CARLA itself,
+through the same lenses (``carla_<camera>_<frame>.jpg``).
+
 ``python -m cosmos3_canvas.record <rollout dir> <out.mp4>`` lays them out as
 camera grids side by side: the generated frames, and the WSM drawn over them
-(``--panels generated,overlay,wsm`` adds the WSM alone).
+(``--panels`` picks from generated, overlay, wsm, and, once
+``tools/carla_replay.py`` has rendered the drive with CARLA, carla and
+carla_overlay).
 
 The files are encoded on a background thread so that recording costs the
 rollout little time.
@@ -41,9 +48,22 @@ class Recorder:
         self._thread = threading.Thread(target=self._run, name="cosmos3-record", daemon=True)
         self._thread.start()
 
-    def new_rollout(self) -> None:
+    def new_rollout(self, meta: dict | None = None) -> None:
+        """Start ``rollout_<n>``; ``meta`` (the map, the cameras' lenses) goes to its ``meta.json``."""
+        import json
+
         self.dir = self.root / f"rollout_{self.rollouts:03d}"
         self.rollouts += 1
+        self.dir.mkdir(parents=True, exist_ok=True)
+        if meta is not None:
+            (self.dir / "meta.json").write_text(json.dumps(meta, indent=1))
+
+    def poses(self, t: float, record: dict) -> None:
+        """One tick's poses (CARLA frame), ``t`` seconds after the rollout's start, to ``poses.jsonl``."""
+        import json
+
+        with open(self.dir / "poses.jsonl", "a") as f:
+            f.write(json.dumps({"t": round(t, 6), **record}) + "\n")
 
     def put(self, kind: str, frames: range, images: np.ndarray) -> None:
         """``images``: ``[V, F, H, W, 3]`` uint8 for the configured cameras at stream ``frames``."""
@@ -87,7 +107,16 @@ def overlay(rgb: np.ndarray, wsm: np.ndarray, alpha: float = 0.6) -> np.ndarray:
 
 
 #: the panels a video frame can show side by side, each a grid of the cameras
-PANELS = {"generated": "generated", "overlay": "WSM over generated", "wsm": "WSM control"}
+PANELS = {"generated": "generated", "overlay": "WSM over generated", "wsm": "WSM control",
+          "carla": "CARLA", "carla_overlay": "WSM over CARLA"}
+
+
+def _panel(panel: str, rgb: np.ndarray | None, wsm: np.ndarray | None,
+           real: np.ndarray | None) -> np.ndarray | None:
+    base = {"generated": rgb, "overlay": rgb, "wsm": wsm, "carla": real, "carla_overlay": real}[panel]
+    if base is None or panel not in ("overlay", "carla_overlay"):
+        return base
+    return None if wsm is None else overlay(base, wsm)
 
 
 def compose(directory: Path, frame: int, cameras: Sequence[str],
@@ -101,6 +130,7 @@ def compose(directory: Path, frame: int, cameras: Sequence[str],
 
     rgb = {c: load("rgb", c) for c in cameras}
     wsm = {c: load("wsm", c) for c in cameras}
+    real = {c: load("carla", c) for c in cameras} if {"carla", "carla_overlay"} & set(panels) else {}
     shape = next((im.shape for im in rgb.values() if im is not None), None)
     if shape is None:
         return None
@@ -113,11 +143,8 @@ def compose(directory: Path, frame: int, cameras: Sequence[str],
             tiles = []
             for camera in row:
                 image = None
-                if camera in cameras and rgb[camera] is not None:
-                    if panel == "generated":
-                        image = rgb[camera]
-                    elif wsm[camera] is not None:
-                        image = overlay(rgb[camera], wsm[camera]) if panel == "overlay" else wsm[camera]
+                if camera in cameras:
+                    image = _panel(panel, rgb[camera], wsm[camera], real.get(camera))
                 if image is None:
                     tiles.append(np.zeros(shape, np.uint8))
                     continue

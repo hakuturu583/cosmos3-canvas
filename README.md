@@ -151,6 +151,15 @@ renderer:
 python -m cosmos3_canvas.record /tmp/cosmos3_record/rollout_000 out.mp4   # --panels generated,overlay,wsm
 ```
 
+A rollout also records the poses of the ego, the actors and the cameras at each tick, and each camera's lens. `tools/carla_replay.py` uses them to render the same drive with CARLA itself, in a server without carla_canvas. Each camera is a wide pinhole at the recorded pose, resampled into the Hyperion F-theta lens. These frames land pixel for pixel on the generated frames and on their WSM, which shows what the model made of the scene:
+
+```bash
+python tools/carla_replay.py /tmp/cosmos3_record/rollout_000 --port 2000   # a Python with the CARLA client
+python -m cosmos3_canvas.record /tmp/cosmos3_record/rollout_000 out.mp4 --panels carla,carla_overlay,generated
+```
+
+The ego's own body is left out (`--with-ego` puts it in). Map props, such as parked cars that are part of the level, show in CARLA's frames but not in the WSM.
+
 ## Cameras
 
 The cameras are the model's: the Hyperion 8 cameras, each through its own F-theta lens (the cookbook's intrinsics), generated at the run's `resolution` (832x480 at `480`). A CARLA camera standing for one gets that fisheye image as it is, so it must be exactly that camera:
