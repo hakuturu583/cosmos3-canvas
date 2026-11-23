@@ -45,6 +45,7 @@ Configuration (``renderer`` section of the carla_canvas file)::
         resolution: "480"
         actors: ["vehicle.*", "walker.pedestrian.*"]
         engine: framework        # or flashdreams (cameras only, about 3x faster; see below)
+        record_dir: /tmp/cosmos3_record  # optional: write each frame's WSM and generated image (record.py)
 
 ``engine: flashdreams`` generates with NVIDIA's FlashDreams runtime
 (flashdreams_stream.py) instead of cosmos-framework's sampler: the cameras
@@ -168,6 +169,11 @@ class Cosmos3Renderer(Renderer):
         self.engine = str(o.get("engine", "framework"))
         if self.engine not in ("framework", "flashdreams"):
             raise ValueError(f"engine {self.engine!r}: framework or flashdreams")
+        self._recorder = None
+        if o.get("record_dir"):
+            from .record import Recorder
+
+            self._recorder = Recorder(o["record_dir"], self.cameras, GENERATED_SIZE[self.resolution])
         self._rdshq: tuple[Path, str] | None = None
         self._tmp: tempfile.TemporaryDirectory | None = None
         self._map_key: str | None = None
@@ -240,6 +246,8 @@ class Cosmos3Renderer(Renderer):
             return RayHits(distance=np.where(hit, distance, np.inf), intensity=np.where(hit, intensity, 0.0))
 
     def close(self) -> None:
+        if self._recorder is not None:
+            self._recorder.flush()
         with self._lock:
             self._rollout = None
             self._stream = None
@@ -299,6 +307,8 @@ class Cosmos3Renderer(Renderer):
             self._stream.reset()
             rollout = self._rollout = _Rollout(t0=t, last_time=t, ego_id=ego_id)
             rollout.wsm = {key: WsmCamera(*self._rdshq, key) for key in self.cameras}
+            if self._recorder is not None:
+                self._recorder.new_rollout()
         rollout.last_time = t
         self._track(rollout, scene, t)
         return rollout
@@ -435,16 +445,21 @@ class Cosmos3Renderer(Renderer):
 
     def _camera_controls(self, rollout: _Rollout, frames: range) -> np.ndarray:
         """[V,F,720,1280,3] WSM control frames of the configured cameras at stream ``frames``."""
-        return np.stack([
+        controls = np.stack([
             np.stack([rollout.wsm[key].render(self._camera_pose(rollout, key, rollout.t0 + f * FRAME_SECONDS),
                                               self._boxes(rollout, rollout.t0 + f * FRAME_SECONDS))
                       for f in frames])
             for key in self.cameras])
+        if self._recorder is not None:
+            self._recorder.put("wsm", frames, controls)
+        return controls
 
     def _keep(self, rollout: _Rollout, k: int, frames: range, rgb: np.ndarray, controls_seconds: float,
               seconds: dict[str, float]) -> None:
         for i, f in enumerate(frames):
             rollout.frames[f] = [rgb[v, i] for v in range(len(self.cameras))]
+        if self._recorder is not None:
+            self._recorder.put("rgb", frames, rgb)
         for old in [f for f in rollout.frames if f < frames.start - 24]:
             del rollout.frames[old]
         timing = {"chunk": k, "controls": controls_seconds, **seconds}

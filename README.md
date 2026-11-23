@@ -33,6 +33,7 @@ The model generates the Hyperion 8 cameras and the Pandar128 LiDAR together, one
 | `flashdreams_stream.py` | The same chunks with [FlashDreams](https://github.com/NVIDIA/flashdreams) (`engine: flashdreams`), cameras only: its `ChunkRollout` reads each chunk's controls from a provider, which here hands it the drawn WSM frames shrunk to the generated size, and its streaming TAEHV decoder decodes them. See [FlashDreams engine](#flashdreams-engine). |
 | `controls.py` | Draws the controls with the cookbook's renderers (`cosmos_auto`), one frame or sweep at a time: WSM v4 control frames, and LiDAR HD-map range maps. The map is the CARLA map's OpenDRIVE, exported to RDS-HQ with [roadgen](https://pypi.org/project/roadgen/). The poses and boxes come from the live scene. The renderers' steps that read the whole clip are replaced by ones that read only the past (the module's docstring lists them). |
 | `renderer.py` | The carla_canvas renderer. It tracks the ego's sensors and the actors, and extrapolates their poses for the rest of a chunk (`trajectory.py`, from lidarverse_canvas). It generates a chunk when a tick needs one. |
+| `record.py` | With `record_dir`: writes each frame's WSM controls and generated images, and lays them out as a video. See [Recording](#recording). |
 | `sensors.py` | Turns the outputs into measurements. A CARLA camera gets its Hyperion camera's generated F-theta (fisheye) image as it is. A LiDAR ray reads the range-map cell it points at. |
 
 Checked against the framework's batch inference on the same controls:
@@ -135,6 +136,20 @@ Measured on an RTX PRO 6000 Max-Q with six cameras at 480p. Each chunk is 0.4 s.
 | a chunk | about 20 s | about 6 s |
 
 With seven cameras (FlashDreams' `--views 7` set, adding `camera_front_tele_30fov`), generating takes about 6.5 s per chunk. A chunk is 12 frames per camera, so this is about 2 fps per camera: not real time. FlashDreams' own sample runs at 15 fps with one camera, and 1.7 fps with seven, on the same GPU.
+
+## Recording
+
+`record_dir` writes, for every frame and configured camera, the WSM control frame the model was given and the frame it generated (`record.py`). A video of them, the generated cameras next to the WSM drawn over them:
+
+```yaml
+renderer:
+  options:
+    record_dir: /tmp/cosmos3_record   # rollout_000/, rollout_001/, ... one per rollout
+```
+
+```bash
+python -m cosmos3_canvas.record /tmp/cosmos3_record/rollout_000 out.mp4   # --panels generated,overlay,wsm
+```
 
 ## Cameras
 
